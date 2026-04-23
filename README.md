@@ -8,10 +8,12 @@ a SLURM cluster deployed with [Soperator](https://github.com/nebius/soperator).
 ```
 davide_demoday
 ├── README.md                
-├── terraform/                    ← Provisions the SLURM cluster on Nebius
-│   ├── main.tf
-│   ├── variables.tf
-│   └── terraform.tfvars.example
+├── soperator/                    ← Provisions the SLURM cluster on Nebius
+│   ├── installations
+        ├── acmepoc               ← Pre-configured Soperator installation
+        └── example
+│   ├── modules
+│   └── test
 └── qwen72b_finetuning/           ← Fine-tuning example
     ├── README.md            
     ├── setup_environment.sh
