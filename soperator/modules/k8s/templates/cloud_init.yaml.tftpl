@@ -1,0 +1,212 @@
+#cloud-config
+%{ if length(ssh_users) > 0 }
+users:
+%{ for user in ssh_users }
+  - name: "${user.name}"
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+%{ for key in user.public_keys }
+      - "${key}"
+%{ endfor }
+%{ endfor }
+%{ endif }
+
+%{ if local_nvme_enabled }
+package_update: true
+packages:
+  - mdadm
+  - nvme-cli
+%{ if local_nvme_filesystem_type == "xfs" }
+  - xfsprogs
+%{ endif }
+%{ endif }
+
+%{ if length(nvidia_admin_conf_lines) > 0 || local_nvme_enabled }
+write_files:
+%{ if length(nvidia_admin_conf_lines) > 0 }
+  - path: /etc/modprobe.d/nvidia_admin.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+%{ for line in nvidia_admin_conf_lines }
+      ${line}
+%{ endfor }
+  - path: /usr/local/bin/nvidia-conf-check.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        reboot_guard="/var/lib/nvidia-conf.rebooted"
+        modprobe_conf="/etc/modprobe.d/nvidia_admin.conf"
+
+        log_prefix="[nvidia-conf]"
+        log() {
+            echo "$${log_prefix} $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
+        }
+
+        log "start"
+
+        if [ ! -f "$${modprobe_conf}" ]; then
+            log "status=skip reason=missing_conf file=$${modprobe_conf}"
+            exit 0
+        fi
+
+        desired_restrict_profiling="$(grep NVreg_RestrictProfilingToAdminUsers "$${modprobe_conf}"  | cut -d'=' -f2)"
+        desired_streammem="$(grep -Eo 'NVreg_EnableStreamMemOPs=[0-9]+' "$${modprobe_conf}" | tail -n1 | cut -d= -f2 || true)"
+        desired_peer_override="$(grep -Eo 'PeerMappingOverride=[0-9]+' "$${modprobe_conf}" | tail -n1 | cut -d= -f2 || true)"
+
+        log "desired_restrict_profiling=$${desired_restrict_profiling:-unknown} desired_streammem=$${desired_streammem:-unknown} desired_peer_override=$${desired_peer_override:-unknown}"
+
+        if [ ! -r /proc/driver/nvidia/params ]; then
+            log "status=skip reason=nvidia_params_missing"
+            exit 0
+        fi
+
+        current_restrict_profiling="$(grep -i RmProfilingAdminOnly /proc/driver/nvidia/params | cut -d':' -f2 | xargs)"
+        current_streammem="$(grep -iE '^EnableStreamMemOPs:' /proc/driver/nvidia/params | cut -d':' -f2 | xargs || true)"
+        current_peer_override="$(grep -Eo 'PeerMappingOverride=[0-9]+' /proc/driver/nvidia/params | cut -d= -f2 || true)"
+
+        log "current_restrict_profiling=$${current_restrict_profiling:-unknown} current_streammem=$${current_streammem:-unknown} current_peer_override=$${current_peer_override:-unknown}"
+
+        mismatch=0
+
+        if [ -n "$${desired_restrict_profiling}" ] && [ -n "$${current_restrict_profiling}" ] && [ "$${current_restrict_profiling}" != "$${desired_restrict_profiling}" ]; then
+            mismatch=1
+            log "mismatch=RmProfilingAdminOnly desired=$${desired_restrict_profiling} current=$${current_restrict_profiling}"
+        fi
+
+        if [ -n "$${desired_streammem}" ] && [ -n "$${current_streammem}" ] && [ "$${current_streammem}" != "$${desired_streammem}" ]; then
+            mismatch=1
+            log "mismatch=EnableStreamMemOPs desired=$${desired_streammem} current=$${current_streammem}"
+        fi
+
+        if [ -n "$${desired_peer_override}" ] && [ -n "$${current_peer_override}" ] && [ "$${current_peer_override}" != "$${desired_peer_override}" ]; then
+            mismatch=1
+            log "mismatch=PeerMappingOverride desired=$${desired_peer_override} current=$${current_peer_override}"
+        fi
+
+        if [ "$${mismatch}" -eq 1 ]; then
+            if [ -f "$${reboot_guard}" ]; then
+                log "action=skip reboot (guard exists)"
+            else
+                log "action=reboot (mismatch)"
+                mkdir -p "$(dirname "$${reboot_guard}")"
+                date -u +%Y-%m-%dT%H:%M:%SZ > "$${reboot_guard}"
+                shutdown -r +1 "cloud-init: apply /etc/modprobe.d/nvidia_admin.conf"
+            fi
+        else
+            log "status=ok"
+        fi
+
+        log "end"
+%{ endif }
+%{ if local_nvme_enabled }
+  - path: /usr/local/sbin/prepare-disks.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      MOUNTPOINT="$${1:-/mnt/local-nvme}"
+      FILESYSTEM_TYPE="${local_nvme_filesystem_type}"
+      MD_DEV="/dev/md0"
+      case "$${FILESYSTEM_TYPE}" in
+        ext4)
+          MOUNT_OPTS="noatime,nodiratime,lazytime,commit=60"
+          MKFS_CMD=(mkfs.ext4 -F -m 0)
+          ;;
+        xfs)
+          MOUNT_OPTS="noatime,nodiratime,logbufs=8,inode64"
+          MKFS_CMD=(mkfs.xfs -f)
+          ;;
+        *)
+          echo "Unsupported filesystem type: $${FILESYSTEM_TYPE}"
+          exit 1
+          ;;
+      esac
+
+      echo "Detecting NVMe disks..."
+      nvme list
+
+      mapfile -t NVME_DISKS < <(
+        nvme list | awk 'NR>2 && $1 ~ /^\/dev\/nvme[0-9]+n[0-9]+$/ { print $1 }' | sort -V | uniq
+      )
+
+      ROOT_SOURCE="$(findmnt -n -o SOURCE / || true)"
+      ROOT_PKNAME="$(lsblk -no PKNAME "$${ROOT_SOURCE}" 2>/dev/null || true)"
+      if [[ -n "$${ROOT_PKNAME}" ]]; then
+        ROOT_DISK="/dev/$${ROOT_PKNAME}"
+        FILTERED=()
+        for d in "$${NVME_DISKS[@]}"; do
+          if [[ "$${d}" != "$${ROOT_DISK}" ]]; then
+            FILTERED+=("$${d}")
+          fi
+        done
+        NVME_DISKS=("$${FILTERED[@]}")
+      fi
+
+      DISK_COUNT="$${#NVME_DISKS[@]}"
+      if (( DISK_COUNT < 2 || DISK_COUNT > 8 )); then
+        echo "Expected 2..8 NVMe disks for RAID0, found $${DISK_COUNT}: $${NVME_DISKS[*]}"
+        exit 1
+      fi
+
+      for d in "$${NVME_DISKS[@]}"; do
+        [[ -b "$${d}" ]] || { echo "Block device not found: $${d}"; exit 1; }
+      done
+
+      echo "Using $${DISK_COUNT} NVMe disk(s): $${NVME_DISKS[*]}"
+
+      for d in "$${NVME_DISKS[@]}"; do
+        DISK_BASENAME="$(basename "$${d}")"
+        SCHEDULER_PATH="/sys/block/$${DISK_BASENAME}/queue/scheduler"
+        if [[ -w "$${SCHEDULER_PATH}" ]]; then
+          echo none | tee "$${SCHEDULER_PATH}" >/dev/null
+        else
+          echo "Skipping scheduler update for $${d}: $${SCHEDULER_PATH} is not writable"
+        fi
+      done
+
+      if [[ -e "$${MD_DEV}" ]]; then
+        mdadm --stop "$${MD_DEV}" || true
+      fi
+
+      mdadm --create "$${MD_DEV}" \
+        --level=0 \
+        --raid-devices="$${DISK_COUNT}" \
+        "$${NVME_DISKS[@]}"
+
+      udevadm settle
+
+      "$${MKFS_CMD[@]}" "$${MD_DEV}"
+
+      mkdir -p "$${MOUNTPOINT}"
+      mount -o "$${MOUNT_OPTS}" "$${MD_DEV}" "$${MOUNTPOINT}"
+
+      UUID="$(blkid -s UUID -o value "$${MD_DEV}")"
+      grep -q "$${UUID}" /etc/fstab || echo "UUID=$${UUID} $${MOUNTPOINT} $${FILESYSTEM_TYPE} $${MOUNT_OPTS},nofail 0 2" >> /etc/fstab
+
+      if [[ -d /etc/mdadm ]]; then
+        mdadm --detail --scan > /etc/mdadm/mdadm.conf
+      fi
+
+      echo "Done."
+      echo "RAID device: $${MD_DEV}"
+      echo "Mounted at : $${MOUNTPOINT}"
+      df -h "$${MOUNTPOINT}"
+%{ endif }
+%{ endif }
+
+%{ if length(nvidia_admin_conf_lines) > 0 || local_nvme_enabled }
+runcmd:
+%{ if length(nvidia_admin_conf_lines) > 0 }
+  - [ bash, -lc, "/usr/local/bin/nvidia-conf-check.sh >> /var/log/nvidia-conf-check.log 2>&1" ]
+%{ endif }
+%{ if local_nvme_enabled }
+  - [ bash, -lc, "/usr/local/sbin/prepare-disks.sh ${local_nvme_mount_path} > /var/log/prepare-disks.log 2>&1" ]
+%{ endif }
+%{ endif }

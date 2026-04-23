@@ -1,0 +1,233 @@
+set -e
+
+CONTEXT="${k8s_cluster_context}"
+NAMESPACE="flux-system"
+HELMRELEASE_NAME="${helmrelease_name}"
+TIMEOUT_MINUTES="${timeout_minutes}"
+SLEEP_SECONDS=10
+STATUS_INTERVAL=6  # Print status every 6 iterations (1 minute)
+
+START_TIME=$(date +%s)
+DEADLINE=$((START_TIME + TIMEOUT_MINUTES * 60))
+
+# Check if deadline has been reached
+is_timeout() {
+  [ "$(date +%s)" -ge "$DEADLINE" ]
+}
+
+# Get elapsed time in minutes
+get_elapsed_time() {
+  local current_time=$(date +%s)
+  local elapsed_seconds=$((current_time - START_TIME))
+  echo "$((elapsed_seconds / 60))m"
+}
+
+# Get compact one-line state summary from cached HR_JSON
+get_state_summary() {
+  local ready_reason=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Ready") | .reason' 2>/dev/null)
+  local released_reason=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Released") | .reason' 2>/dev/null)
+
+  if [ -z "$ready_reason" ]; then
+    ready_reason="Unknown"
+  fi
+
+  # Only show Released status if it has a meaningful value
+  if [ -n "$released_reason" ]; then
+    echo "Ready=$ready_reason, Released=$released_reason"
+  else
+    echo "Ready=$ready_reason"
+  fi
+}
+
+# Print detailed HelmRelease status
+print_hr_status() {
+  echo "=== HelmRelease Status: $HELMRELEASE_NAME ==="
+
+  # Print all conditions
+  echo "Conditions:"
+  kubectl get helmreleases.helm.toolkit.fluxcd.io "$HELMRELEASE_NAME" -n "$NAMESPACE" --context "$CONTEXT" \
+    -o json 2>/dev/null | jq -r '.status.conditions[]? | "  \(.type): \(.status) (\(.reason)) - \(.message // "no message")"' 2>/dev/null || echo "  Unable to fetch conditions"
+
+  # Print helm history (last 3 releases)
+  local target_namespace=$(kubectl get helmreleases.helm.toolkit.fluxcd.io "$HELMRELEASE_NAME" -n "$NAMESPACE" --context "$CONTEXT" \
+    -o jsonpath='{.spec.targetNamespace}' 2>/dev/null)
+
+  if [ -n "$target_namespace" ]; then
+    echo "Helm history (last 3):"
+    helm history "$HELMRELEASE_NAME" -n "$target_namespace" --kube-context "$CONTEXT" --max 3 2>/dev/null | tail -n +2 | while read -r line; do
+      echo "  $line"
+    done || echo "  Unable to fetch helm history"
+  fi
+
+  echo "======================================="
+}
+
+# Print dependency waiting info if DependencyNotReady (uses cached HR_JSON)
+print_dependency_info() {
+  local ready_reason=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Ready") | .reason' 2>/dev/null)
+  local ready_message=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Ready") | .message' 2>/dev/null)
+
+  if [ "$ready_reason" = "DependencyNotReady" ] && [ -n "$ready_message" ]; then
+    echo "  Waiting for dependency: $ready_message"
+  fi
+}
+
+# Fetch HelmRelease JSON with retries. Sets HR_JSON (empty on failure).
+fetch_hr_json() {
+  local retries=3
+  local wait=5
+  HR_JSON=""
+  local stderr_file
+  stderr_file=$(mktemp)
+
+  for i in $(seq 1 "$retries"); do
+    if HR_JSON=$(kubectl get helmreleases.helm.toolkit.fluxcd.io "$HELMRELEASE_NAME" \
+        -n "$NAMESPACE" --context "$CONTEXT" -o json 2>"$stderr_file"); then
+      rm -f "$stderr_file"
+      return 0
+    fi
+    if [ "$i" -lt "$retries" ]; then
+      sleep "$wait"
+    fi
+  done
+
+  echo "WARNING: kubectl failed after $retries attempts: $(cat "$stderr_file")"
+  rm -f "$stderr_file"
+  HR_JSON=""
+}
+
+# Check for failure states and exit early if detected (uses cached HR_JSON)
+# Returns 0 if failure detected (should exit), 1 otherwise
+check_hr_failure() {
+  if [ -z "$HR_JSON" ]; then
+    return 1
+  fi
+
+  local released_reason=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Released") | .reason' 2>/dev/null)
+  local released_message=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Released") | .message' 2>/dev/null)
+  local ready_reason=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Ready") | .reason' 2>/dev/null)
+  local ready_message=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Ready") | .message' 2>/dev/null)
+
+  # Check for Released condition failure reasons
+  case "$released_reason" in
+    InstallFailed|UpgradeFailed|GetLastReleaseFailed|ReconcileStrategyFailed)
+      echo ""
+      echo "ERROR: HelmRelease $HELMRELEASE_NAME has failed!"
+      echo "Reason: $released_reason"
+      echo "Message: $released_message"
+      print_hr_status
+      return 0
+      ;;
+  esac
+
+  # Check for Ready condition failure reasons (permanent errors that won't self-resolve)
+  case "$ready_reason" in
+    StateError)
+      echo ""
+      echo "ERROR: HelmRelease $HELMRELEASE_NAME is in error state!"
+      echo "Reason: $ready_reason"
+      echo "Message: $ready_message"
+      print_hr_status
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+LAST_STATE=""
+ITERATION=0
+
+echo "Waiting for HelmRelease CRD to be available..."
+while true; do
+  if kubectl get crd helmreleases.helm.toolkit.fluxcd.io --context "$CONTEXT" >/dev/null 2>&1; then
+    echo "HelmRelease CRD is available."
+    break
+  fi
+
+  if is_timeout; then
+    echo ""
+    echo "ERROR: Timeout reached waiting for HelmRelease CRD."
+    echo "Flux may not be installed. Checking flux-system namespace:"
+    kubectl get pods -n flux-system --context "$CONTEXT" 2>/dev/null || echo "  Unable to list pods in flux-system namespace"
+    exit 1
+  fi
+
+  ITERATION=$((ITERATION + 1))
+  # Only print status periodically
+  if [ $((ITERATION % STATUS_INTERVAL)) -eq 0 ]; then
+    echo "[$(get_elapsed_time)] Waiting for HelmRelease CRD..."
+  fi
+  sleep "$SLEEP_SECONDS"
+done
+
+echo "Waiting for HelmRelease $HELMRELEASE_NAME to be created..."
+ITERATION=0
+while true; do
+  if kubectl get helmreleases.helm.toolkit.fluxcd.io "$HELMRELEASE_NAME" -n "$NAMESPACE" --context "$CONTEXT" >/dev/null 2>&1; then
+    echo "HelmRelease $HELMRELEASE_NAME exists."
+    break
+  fi
+
+  if is_timeout; then
+    echo ""
+    echo "ERROR: Timeout reached waiting for HelmRelease $HELMRELEASE_NAME to be created."
+    echo "Existing HelmReleases in $NAMESPACE namespace:"
+    kubectl get helmreleases.helm.toolkit.fluxcd.io -n "$NAMESPACE" --context "$CONTEXT" 2>/dev/null || echo "  Unable to list HelmReleases"
+    echo "Kustomization status:"
+    kubectl get kustomizations.kustomize.toolkit.fluxcd.io -n "$NAMESPACE" --context "$CONTEXT" 2>/dev/null || echo "  Unable to list Kustomizations"
+    exit 1
+  fi
+
+  ITERATION=$((ITERATION + 1))
+  # Only print status periodically
+  if [ $((ITERATION % STATUS_INTERVAL)) -eq 0 ]; then
+    echo "[$(get_elapsed_time)] Waiting for HelmRelease $HELMRELEASE_NAME to be created..."
+  fi
+  sleep "$SLEEP_SECONDS"
+done
+
+echo "Waiting for HelmRelease $HELMRELEASE_NAME to be successfully installed..."
+ITERATION=0
+while true; do
+  # Fetch HelmRelease JSON once per iteration (used by all helper functions)
+  fetch_hr_json
+
+  # Check for failure states first (early exit)
+  if check_hr_failure; then
+    exit 1
+  fi
+
+  # Check if the HelmRelease is fully ready (both Released and Ready conditions must be True)
+  if [ -n "$HR_JSON" ]; then
+    RELEASE_STATUS_REASON=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Released") | .reason' 2>/dev/null) || true
+    RELEASE_STATUS_STATUS=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Released") | .status' 2>/dev/null) || true
+    READY_STATUS=$(echo "$HR_JSON" | jq -r '.status.conditions[]? | select(.type=="Ready") | .status' 2>/dev/null) || true
+
+    if [[ "$RELEASE_STATUS_REASON" = "InstallSucceeded" || "$RELEASE_STATUS_REASON" = "UpgradeSucceeded" ]] && [ "$RELEASE_STATUS_STATUS" = "True" ] && [ "$READY_STATUS" = "True" ]; then
+      echo ""
+      echo "SUCCESS: HelmRelease $HELMRELEASE_NAME has been successfully installed."
+      echo "$HR_JSON" | jq -r '.status.conditions[]? | "  \(.type): \(.status) (\(.reason))"' 2>/dev/null || true
+      exit 0
+    fi
+  fi
+
+  if is_timeout; then
+    echo ""
+    echo "ERROR: Timeout reached waiting for HelmRelease $HELMRELEASE_NAME to be successfully installed."
+    print_hr_status
+    exit 1
+  fi
+
+  ITERATION=$((ITERATION + 1))
+  CURRENT_STATE=$(get_state_summary)
+
+  # Print status on state change or periodically (every 1 minute)
+  if [ "$CURRENT_STATE" != "$LAST_STATE" ] || [ "$((ITERATION % STATUS_INTERVAL))" -eq 0 ]; then
+    echo "[$(get_elapsed_time)] $HELMRELEASE_NAME: $CURRENT_STATE"
+    print_dependency_info
+    LAST_STATE="$CURRENT_STATE"
+  fi
+
+  sleep "$SLEEP_SECONDS"
+done

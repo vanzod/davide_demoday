@@ -1,0 +1,12 @@
+resources:
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: soperator-fluxcd-values
+      labels:
+        reconcile.fluxcd.io/watch: Enabled
+      annotations:
+        "helm.sh/resource-policy": keep
+    data:
+      values.yaml: |
+        # Empty config map for ad-hoc values overrides
