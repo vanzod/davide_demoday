@@ -10,8 +10,8 @@ davide_demoday
 ├── README.md                
 ├── soperator/                    ← Provisions the SLURM cluster on Nebius
 │   ├── installations
-|   |   ├── acmepoc               ← Pre-configured Soperator installation
-|   |   └── example
+│   │   ├── acmepoc               ← Pre-configured Soperator installation
+│   │   └── example
 │   ├── modules
 │   └── test
 └── qwen72b_finetuning/           ← Fine-tuning example
